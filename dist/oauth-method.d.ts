@@ -20,6 +20,8 @@ export interface OAuthDeps {
     setActiveAccountSource: (source: string) => void;
     saveAccountSource: (source: string) => void;
     reloadCredentialsFromSource: () => ClaudeCredentials | null;
+    /** Raw read of the account's store, without the usable-expiry check. */
+    readStoredCredentials: (source: string, configDir: string | undefined) => ClaudeCredentials | null;
     refreshViaOAuth: (refreshToken: string) => Promise<ClaudeCredentials | null>;
     writeBackCredentials: (source: string, creds: ClaudeCredentials, configDir: string | undefined, expectedPriorAccessToken: string) => boolean;
     log: (event: string, data?: Record<string, unknown>) => void;

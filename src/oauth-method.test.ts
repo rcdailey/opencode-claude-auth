@@ -47,6 +47,7 @@ function makeDeps(overrides: Partial<OAuthDeps> = {}): OAuthDeps & {
       calls.saveAccountSource.push(source)
     },
     reloadCredentialsFromSource: () => null,
+    readStoredCredentials: () => null,
     refreshViaOAuth: async () => null,
     writeBackCredentials: (source, creds, configDir, expected) => {
       calls.writeBackCredentials.push([source, creds, configDir, expected])

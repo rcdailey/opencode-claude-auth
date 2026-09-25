@@ -1,6 +1,6 @@
 import { Credential, Integration } from "@opencode/plugin";
 import { getCachedCredentials, loadPersistedAccountSource, refreshAccountsList, refreshViaOAuth, reloadCredentialsFromSource, saveAccountSource, setActiveAccountSource, } from "./credentials.js";
-import { writeBackCredentials, } from "./keychain.js";
+import { refreshAccount, writeBackCredentials, } from "./keychain.js";
 import { log } from "./logger.js";
 export const INTEGRATION_ID = Integration.ID.make("anthropic");
 export const METHOD_ID = Integration.MethodID.make("claude-code");
@@ -110,11 +110,29 @@ export async function refreshOAuthCredential(value, deps) {
             expires: fresh.expiresAt,
         });
     }
-    const refreshed = await deps.refreshViaOAuth(value.refresh);
+    // The reload above rejects a store whose access token is about to expire,
+    // but its refresh token can still be newer than ours: after a sleep past
+    // expiry, `claude` may have rotated it while our copy is already dead.
+    // Refresh with the stored token and compare-and-swap against the stored
+    // access token so the store receives the rotation.
+    let stored = null;
+    try {
+        if (source)
+            stored = deps.readStoredCredentials(source, configDir);
+    }
+    catch {
+        // A locked or denied keychain leaves our own token as the only candidate.
+    }
+    const current = stored?.refreshToken
+        ? stored
+        : { accessToken: value.access, refreshToken: value.refresh };
+    if (current.refreshToken !== value.refresh)
+        deps.log("refresh_using_stored_refresh_token", { source });
+    const refreshed = await deps.refreshViaOAuth(current.refreshToken);
     if (!refreshed)
         throw new Error("Claude OAuth refresh failed. Run `claude` to re-authenticate.");
     if (source)
-        deps.writeBackCredentials(source, refreshed, configDir, value.access);
+        deps.writeBackCredentials(source, refreshed, configDir, current.accessToken);
     return Credential.OAuth.make({
         ...value,
         methodID: METHOD_ID,
@@ -136,6 +154,7 @@ export const realOAuthDeps = {
     setActiveAccountSource,
     saveAccountSource,
     reloadCredentialsFromSource,
+    readStoredCredentials: refreshAccount,
     refreshViaOAuth,
     writeBackCredentials,
     log,
