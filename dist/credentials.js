@@ -1,12 +1,12 @@
 import { execSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync, } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { PRIMARY_SERVICE, readAllClaudeAccounts, refreshAccount, writeBackCredentials, } from "./keychain.js";
 import { resetExcludedBetas } from "./betas.js";
-import { fetchWithRetry } from "./http.js";
 import { log } from "./logger.js";
-import { classifyRefreshFailure, clearRefreshOutcome, getRefreshCooldownUntil, getRefreshFailureKind, isRefreshCooldownActive, noteRefreshTerminal, noteRefreshTransient, } from "./refresh-backoff.js";
+import { classifyRefreshFailure, clearRefreshOutcome, computeBackoffMs, getRefreshCooldownUntil, getRefreshFailureKind, isRefreshCooldownActive, noteRefreshTerminal, noteRefreshTransient, } from "./refresh-backoff.js";
 import { acquireRefreshLock } from "./refresh-lock.js";
 const CREDENTIAL_CACHE_TTL_MS = 30_000;
 // Only inside this window will the claude CLI actually rotate a token, so
@@ -216,14 +216,69 @@ const OAUTH_TIMEOUT_MS = 15_000;
 function parseRetryAfterMs(headerValue) {
     if (!headerValue)
         return undefined;
-    const seconds = Number.parseInt(headerValue, 10);
-    return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : undefined;
+    const seconds = Number(headerValue);
+    const ms = Number.isFinite(seconds)
+        ? seconds * 1000
+        : Date.parse(headerValue) - Date.now();
+    return Number.isFinite(ms) && ms > 0 ? ms : undefined;
 }
+const oauthExchanges = new Map();
+const oauthCooldowns = new Map();
 /**
- * Exchange a refresh token for fresh credentials and classify the result.
- * See {@link RefreshOutcome}. Uses the runtime's own fetch (no subprocess).
+ * Exchange a refresh token once and classify the result. Concurrent callers
+ * using that token share one exchange, whose timeout is set by its first caller.
+ * Transient failures impose a cooldown, honoring Retry-After without a cap;
+ * calls during it return the failure with the remaining delay, without HTTP.
+ *
+ * Coordination is shared by this loaded module, not separate processes or the
+ * Claude CLI. Cross-process bursts require persisted cooldowns and a shared
+ * coordinator; the request path's existing advisory lock is not sufficient.
  */
 export async function refreshViaOAuthDetailed(refreshToken, timeoutMs = OAUTH_TIMEOUT_MS) {
+    const key = createHash("sha256").update(refreshToken).digest("hex");
+    const pending = oauthExchanges.get(key);
+    if (pending) {
+        log("oauth_refresh_joined");
+        return pending;
+    }
+    const cooldown = oauthCooldowns.get(key);
+    // Forget cooled-down tokens no longer in use, retaining escalation for this one.
+    for (const [other, state] of oauthCooldowns) {
+        if (other !== key && state.until <= Date.now())
+            oauthCooldowns.delete(other);
+    }
+    if (cooldown && cooldown.until > Date.now()) {
+        const retryAfterMs = cooldown.until - Date.now();
+        log("oauth_refresh_cooldown", {
+            retryAfterMs,
+            status: cooldown.outcome.status,
+        });
+        return { ...cooldown.outcome, retryAfterMs };
+    }
+    const exchange = performOAuthExchange(refreshToken, timeoutMs).then((outcome) => {
+        if (outcome.kind !== "transient") {
+            oauthCooldowns.delete(key);
+            return outcome;
+        }
+        const consecutive = (cooldown?.consecutive ?? 0) + 1;
+        const retryAfterMs = Math.max(computeBackoffMs(consecutive), outcome.retryAfterMs ?? 0);
+        oauthCooldowns.set(key, {
+            until: Date.now() + retryAfterMs,
+            consecutive,
+            outcome,
+        });
+        log("oauth_refresh_cooldown", { retryAfterMs, status: outcome.status });
+        return { ...outcome, retryAfterMs };
+    });
+    oauthExchanges.set(key, exchange);
+    try {
+        return await exchange;
+    }
+    finally {
+        oauthExchanges.delete(key);
+    }
+}
+async function performOAuthExchange(refreshToken, timeoutMs) {
     const body = new URLSearchParams({
         grant_type: "refresh_token",
         client_id: OAUTH_CLIENT_ID,
@@ -233,7 +288,7 @@ export async function refreshViaOAuthDetailed(refreshToken, timeoutMs = OAUTH_TI
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
         log("refresh_started", { source: "oauth" });
-        const response = await fetchWithRetry(OAUTH_TOKEN_URL, {
+        const response = await fetch(OAUTH_TOKEN_URL, {
             method: "POST",
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
             body: body.toString(),

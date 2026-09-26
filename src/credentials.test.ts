@@ -1722,11 +1722,11 @@ describe("refreshViaOAuth", () => {
     }
   })
 
-  // The token endpoint rate-limits valid refresh requests readily, and
-  // several OpenCode instances refreshing near expiry cluster their calls.
-  // The API request path already retries 429; this one did not.
-  it("retries a rate-limited refresh instead of failing outright", async () => {
+  it("defers a rate-limited refresh until the cooldown ends", async () => {
     const originalFetch = globalThis.fetch
+    const originalNow = Date.now
+    let now = originalNow()
+    Date.now = () => now
     let calls = 0
 
     globalThis.fetch = (async () => {
@@ -1734,7 +1734,7 @@ describe("refreshViaOAuth", () => {
       if (calls === 1) {
         return new Response(JSON.stringify({ error: "rate_limited" }), {
           status: 429,
-          headers: { "retry-after": "0" },
+          headers: { "retry-after": "120" },
         })
       }
       return new Response(
@@ -1747,12 +1747,18 @@ describe("refreshViaOAuth", () => {
     }) as typeof fetch
 
     try {
-      const result = await refreshViaOAuth("sk-ant-ort01-current")
+      assert.equal(await refreshViaOAuth("sk-ant-ort01-rate-limited"), null)
+      now += 119_999
+      assert.equal(await refreshViaOAuth("sk-ant-ort01-rate-limited"), null)
+      assert.equal(calls, 1, "must not exchange during the server's cooldown")
+      now += 1
+      const result = await refreshViaOAuth("sk-ant-ort01-rate-limited")
       assert.ok(result, "expected the retry to produce credentials")
       assert.equal(result.accessToken, "sk-ant-oat01-after-retry")
       assert.equal(calls, 2, "expected exactly one retry")
     } finally {
       globalThis.fetch = originalFetch
+      Date.now = originalNow
     }
   })
 
@@ -1763,7 +1769,7 @@ describe("refreshViaOAuth", () => {
     }) as typeof fetch
 
     try {
-      assert.equal(await refreshViaOAuth("sk-ant-ort01-current"), null)
+      assert.equal(await refreshViaOAuth("sk-ant-ort01-network-failure"), null)
     } finally {
       globalThis.fetch = originalFetch
     }
@@ -2278,7 +2284,7 @@ describe("borrowed fallback credentials", () => {
   it("guards a recovering borrower's write-back with its own token, not the lender's", async () => {
     const originalFetch = globalThis.fetch
     const originalNow = Date.now
-    const now = 1_700_000_000_000
+    let now = 1_700_000_000_000
     Date.now = () => now
 
     let oauthFails = true
@@ -2337,6 +2343,7 @@ describe("borrowed fallback credentials", () => {
 
       const writesBefore = keychainModule.__getWrites().length
       oauthFails = false
+      now += 60_000 // Allow the failed exchange's cooldown to expire before recovery.
 
       // A threshold wider than the borrowed credential's remaining life
       // forces a refresh while leaving it usable, so the up-front re-read

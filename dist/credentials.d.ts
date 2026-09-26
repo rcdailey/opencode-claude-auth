@@ -44,10 +44,9 @@ export declare function extractOAuthError(raw: string): {
  * Node 18+ and Bun both expose a global fetch, so no subprocess is needed.
  */
 /**
- * Classified result of an OAuth refresh. A `transient` outcome (429/5xx/network
- * /`rate_limit_error`) means the refresh token is still good and the caller
- * should back off and retry rather than surface a hard error; a `terminal`
- * outcome (`invalid_grant`, ...) means the refresh token is dead.
+ * Classified result of an OAuth refresh. A `transient` outcome (429/5xx/network)
+ * does not establish token validity; retry after `retryAfterMs` rather than
+ * requesting another login. A `terminal` outcome is an explicit OAuth rejection.
  */
 export type RefreshOutcome = {
     kind: "ok";
@@ -63,8 +62,14 @@ export type RefreshOutcome = {
     oauthError?: string;
 };
 /**
- * Exchange a refresh token for fresh credentials and classify the result.
- * See {@link RefreshOutcome}. Uses the runtime's own fetch (no subprocess).
+ * Exchange a refresh token once and classify the result. Concurrent callers
+ * using that token share one exchange, whose timeout is set by its first caller.
+ * Transient failures impose a cooldown, honoring Retry-After without a cap;
+ * calls during it return the failure with the remaining delay, without HTTP.
+ *
+ * Coordination is shared by this loaded module, not separate processes or the
+ * Claude CLI. Cross-process bursts require persisted cooldowns and a shared
+ * coordinator; the request path's existing advisory lock is not sufficient.
  */
 export declare function refreshViaOAuthDetailed(refreshToken: string, timeoutMs?: number): Promise<RefreshOutcome>;
 /**

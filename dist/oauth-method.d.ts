@@ -1,5 +1,6 @@
 import { Credential, Integration } from "@opencode/plugin";
 import type { IntegrationOAuthMethod } from "@opencode/plugin/promise/integration";
+import { type RefreshOutcome } from "./credentials.ts";
 import { type ClaudeAccount, type ClaudeCredentials } from "./keychain.ts";
 export declare const INTEGRATION_ID: Integration.ID;
 export declare const METHOD_ID: Integration.MethodID;
@@ -22,7 +23,8 @@ export interface OAuthDeps {
     reloadCredentialsFromSource: () => ClaudeCredentials | null;
     /** Raw read of the account's store, without the usable-expiry check. */
     readStoredCredentials: (source: string, configDir: string | undefined) => ClaudeCredentials | null;
-    refreshViaOAuth: (refreshToken: string) => Promise<ClaudeCredentials | null>;
+    /** Shares exchanges and returns cooldown information instead of hiding temporary failures. */
+    refreshViaOAuthDetailed: (refreshToken: string) => Promise<RefreshOutcome>;
     writeBackCredentials: (source: string, creds: ClaudeCredentials, configDir: string | undefined, expectedPriorAccessToken: string) => boolean;
     log: (event: string, data?: Record<string, unknown>) => void;
 }

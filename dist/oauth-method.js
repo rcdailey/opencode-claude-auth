@@ -1,5 +1,5 @@
 import { Credential, Integration } from "@opencode/plugin";
-import { getCachedCredentials, loadPersistedAccountSource, refreshAccountsList, refreshViaOAuth, reloadCredentialsFromSource, saveAccountSource, setActiveAccountSource, } from "./credentials.js";
+import { getCachedCredentials, loadPersistedAccountSource, refreshAccountsList, refreshViaOAuthDetailed, reloadCredentialsFromSource, saveAccountSource, setActiveAccountSource, } from "./credentials.js";
 import { refreshAccount, writeBackCredentials, } from "./keychain.js";
 import { log } from "./logger.js";
 export const INTEGRATION_ID = Integration.ID.make("anthropic");
@@ -128,9 +128,20 @@ export async function refreshOAuthCredential(value, deps) {
         : { accessToken: value.access, refreshToken: value.refresh };
     if (current.refreshToken !== value.refresh)
         deps.log("refresh_using_stored_refresh_token", { source });
-    const refreshed = await deps.refreshViaOAuth(current.refreshToken);
-    if (!refreshed)
-        throw new Error("Claude OAuth refresh failed. Run `claude` to re-authenticate.");
+    const outcome = await deps.refreshViaOAuthDetailed(current.refreshToken);
+    if (outcome.kind !== "ok") {
+        const reason = outcome.status
+            ? `HTTP ${outcome.status}`
+            : "network error or timeout";
+        const code = outcome.oauthError ? `, ${outcome.oauthError}` : "";
+        if (outcome.kind === "transient") {
+            const seconds = Math.max(1, Math.ceil((outcome.retryAfterMs ?? 1000) / 1000));
+            throw new Error(`Claude OAuth refresh temporarily unavailable (${reason}${code}). ` +
+                `Retry in ${seconds}s; re-authentication is not indicated.`);
+        }
+        throw new Error(`Claude OAuth refresh rejected (${reason}${code}). Run \`claude\` to re-authenticate.`);
+    }
+    const refreshed = outcome.creds;
     if (source)
         deps.writeBackCredentials(source, refreshed, configDir, current.accessToken);
     return Credential.OAuth.make({
@@ -155,7 +166,7 @@ export const realOAuthDeps = {
     saveAccountSource,
     reloadCredentialsFromSource,
     readStoredCredentials: refreshAccount,
-    refreshViaOAuth,
+    refreshViaOAuthDetailed,
     writeBackCredentials,
     log,
 };

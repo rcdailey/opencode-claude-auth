@@ -48,7 +48,7 @@ function makeDeps(overrides: Partial<OAuthDeps> = {}): OAuthDeps & {
     },
     reloadCredentialsFromSource: () => null,
     readStoredCredentials: () => null,
-    refreshViaOAuth: async () => null,
+    refreshViaOAuthDetailed: async () => ({ kind: "terminal", status: 400 }),
     writeBackCredentials: (source, creds, configDir, expected) => {
       calls.writeBackCredentials.push([source, creds, configDir, expected])
       return true
@@ -349,9 +349,9 @@ describe("refreshOAuthCredential", () => {
         refreshToken: "fresh-refresh",
         expiresAt: 999,
       }),
-      refreshViaOAuth: async () => {
+      refreshViaOAuthDetailed: async () => {
         refreshViaOAuthCalled = true
-        return null
+        return { kind: "terminal", status: 400 }
       },
     })
     const result = await refreshOAuthCredential(value, deps)
@@ -368,10 +368,13 @@ describe("refreshOAuthCredential", () => {
   it("preserves the Claude Code OAuth marker across refresh", async () => {
     const deps = makeDeps({
       reloadCredentialsFromSource: () => null,
-      refreshViaOAuth: async () => ({
-        accessToken: "refreshed-access",
-        refreshToken: "refreshed-refresh",
-        expiresAt: 111,
+      refreshViaOAuthDetailed: async () => ({
+        kind: "ok",
+        creds: {
+          accessToken: "refreshed-access",
+          refreshToken: "refreshed-refresh",
+          expiresAt: 111,
+        },
       }),
     })
     const result = await refreshOAuthCredential(
@@ -393,10 +396,13 @@ describe("refreshOAuthCredential", () => {
   it("falls through to a network refresh when the keychain is unavailable", async () => {
     const deps = makeDeps({
       reloadCredentialsFromSource: () => null,
-      refreshViaOAuth: async () => ({
-        accessToken: "refreshed-access",
-        refreshToken: "refreshed-refresh",
-        expiresAt: 111,
+      refreshViaOAuthDetailed: async () => ({
+        kind: "ok",
+        creds: {
+          accessToken: "refreshed-access",
+          refreshToken: "refreshed-refresh",
+          expiresAt: 111,
+        },
       }),
     })
     const result = await refreshOAuthCredential(value, deps)
@@ -410,10 +416,13 @@ describe("refreshOAuthCredential", () => {
         refreshToken: "old-refresh",
         expiresAt: 1,
       }),
-      refreshViaOAuth: async () => ({
-        accessToken: "refreshed-access",
-        refreshToken: "refreshed-refresh",
-        expiresAt: 222,
+      refreshViaOAuthDetailed: async () => ({
+        kind: "ok",
+        creds: {
+          accessToken: "refreshed-access",
+          refreshToken: "refreshed-refresh",
+          expiresAt: 222,
+        },
       }),
     })
     const result = await refreshOAuthCredential(value, deps)
@@ -423,7 +432,7 @@ describe("refreshOAuthCredential", () => {
   it("throws a clear error when the network refresh fails", async () => {
     const deps = makeDeps({
       reloadCredentialsFromSource: () => null,
-      refreshViaOAuth: async () => null,
+      refreshViaOAuthDetailed: async () => ({ kind: "terminal", status: 400 }),
     })
     await assert.rejects(
       () => refreshOAuthCredential(value, deps),
@@ -434,10 +443,13 @@ describe("refreshOAuthCredential", () => {
   it("writes back credentials after a successful network refresh", async () => {
     const deps = makeDeps({
       reloadCredentialsFromSource: () => null,
-      refreshViaOAuth: async () => ({
-        accessToken: "refreshed-access",
-        refreshToken: "refreshed-refresh",
-        expiresAt: 333,
+      refreshViaOAuthDetailed: async () => ({
+        kind: "ok",
+        creds: {
+          accessToken: "refreshed-access",
+          refreshToken: "refreshed-refresh",
+          expiresAt: 333,
+        },
       }),
     })
     await refreshOAuthCredential(value, deps)
@@ -457,10 +469,13 @@ describe("refreshOAuthCredential", () => {
   it("does not write back credentials when there is no source in metadata", async () => {
     const deps = makeDeps({
       reloadCredentialsFromSource: () => null,
-      refreshViaOAuth: async () => ({
-        accessToken: "refreshed-access",
-        refreshToken: "refreshed-refresh",
-        expiresAt: 333,
+      refreshViaOAuthDetailed: async () => ({
+        kind: "ok",
+        creds: {
+          accessToken: "refreshed-access",
+          refreshToken: "refreshed-refresh",
+          expiresAt: 333,
+        },
       }),
     })
     await refreshOAuthCredential(
@@ -473,10 +488,13 @@ describe("refreshOAuthCredential", () => {
   it("marks the account active before checking the keychain, only when a source is present", async () => {
     const successfulRefresh = {
       reloadCredentialsFromSource: () => null,
-      refreshViaOAuth: async () => ({
-        accessToken: "refreshed-access",
-        refreshToken: "refreshed-refresh",
-        expiresAt: 999,
+      refreshViaOAuthDetailed: async () => ({
+        kind: "ok" as const,
+        creds: {
+          accessToken: "refreshed-access",
+          refreshToken: "refreshed-refresh",
+          expiresAt: 999,
+        },
       }),
     }
     const deps = makeDeps(successfulRefresh)

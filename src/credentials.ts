@@ -1,4 +1,5 @@
 import { execSync } from "node:child_process"
+import { createHash } from "node:crypto"
 import {
   chmodSync,
   existsSync,
@@ -17,11 +18,11 @@ import {
   type ClaudeCredentials,
 } from "./keychain.ts"
 import { resetExcludedBetas } from "./betas.ts"
-import { fetchWithRetry } from "./http.ts"
 import { log } from "./logger.ts"
 import {
   classifyRefreshFailure,
   clearRefreshOutcome,
+  computeBackoffMs,
   getRefreshCooldownUntil,
   getRefreshFailureKind,
   isRefreshCooldownActive,
@@ -294,10 +295,9 @@ const OAUTH_TIMEOUT_MS = 15_000
  * Node 18+ and Bun both expose a global fetch, so no subprocess is needed.
  */
 /**
- * Classified result of an OAuth refresh. A `transient` outcome (429/5xx/network
- * /`rate_limit_error`) means the refresh token is still good and the caller
- * should back off and retry rather than surface a hard error; a `terminal`
- * outcome (`invalid_grant`, ...) means the refresh token is dead.
+ * Classified result of an OAuth refresh. A `transient` outcome (429/5xx/network)
+ * does not establish token validity; retry after `retryAfterMs` rather than
+ * requesting another login. A `terminal` outcome is an explicit OAuth rejection.
  */
 export type RefreshOutcome =
   | { kind: "ok"; creds: ClaudeCredentials }
@@ -311,17 +311,88 @@ export type RefreshOutcome =
 
 function parseRetryAfterMs(headerValue: string | null): number | undefined {
   if (!headerValue) return undefined
-  const seconds = Number.parseInt(headerValue, 10)
-  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : undefined
+  const seconds = Number(headerValue)
+  const ms = Number.isFinite(seconds)
+    ? seconds * 1000
+    : Date.parse(headerValue) - Date.now()
+  return Number.isFinite(ms) && ms > 0 ? ms : undefined
 }
 
+const oauthExchanges = new Map<string, Promise<RefreshOutcome>>()
+const oauthCooldowns = new Map<
+  string,
+  {
+    until: number
+    consecutive: number
+    outcome: Extract<RefreshOutcome, { kind: "transient" }>
+  }
+>()
+
 /**
- * Exchange a refresh token for fresh credentials and classify the result.
- * See {@link RefreshOutcome}. Uses the runtime's own fetch (no subprocess).
+ * Exchange a refresh token once and classify the result. Concurrent callers
+ * using that token share one exchange, whose timeout is set by its first caller.
+ * Transient failures impose a cooldown, honoring Retry-After without a cap;
+ * calls during it return the failure with the remaining delay, without HTTP.
+ *
+ * Coordination is shared by this loaded module, not separate processes or the
+ * Claude CLI. Cross-process bursts require persisted cooldowns and a shared
+ * coordinator; the request path's existing advisory lock is not sufficient.
  */
 export async function refreshViaOAuthDetailed(
   refreshToken: string,
   timeoutMs = OAUTH_TIMEOUT_MS,
+): Promise<RefreshOutcome> {
+  const key = createHash("sha256").update(refreshToken).digest("hex")
+  const pending = oauthExchanges.get(key)
+  if (pending) {
+    log("oauth_refresh_joined")
+    return pending
+  }
+  const cooldown = oauthCooldowns.get(key)
+  // Forget cooled-down tokens no longer in use, retaining escalation for this one.
+  for (const [other, state] of oauthCooldowns) {
+    if (other !== key && state.until <= Date.now()) oauthCooldowns.delete(other)
+  }
+  if (cooldown && cooldown.until > Date.now()) {
+    const retryAfterMs = cooldown.until - Date.now()
+    log("oauth_refresh_cooldown", {
+      retryAfterMs,
+      status: cooldown.outcome.status,
+    })
+    return { ...cooldown.outcome, retryAfterMs }
+  }
+
+  const exchange = performOAuthExchange(refreshToken, timeoutMs).then(
+    (outcome) => {
+      if (outcome.kind !== "transient") {
+        oauthCooldowns.delete(key)
+        return outcome
+      }
+      const consecutive = (cooldown?.consecutive ?? 0) + 1
+      const retryAfterMs = Math.max(
+        computeBackoffMs(consecutive),
+        outcome.retryAfterMs ?? 0,
+      )
+      oauthCooldowns.set(key, {
+        until: Date.now() + retryAfterMs,
+        consecutive,
+        outcome,
+      })
+      log("oauth_refresh_cooldown", { retryAfterMs, status: outcome.status })
+      return { ...outcome, retryAfterMs }
+    },
+  )
+  oauthExchanges.set(key, exchange)
+  try {
+    return await exchange
+  } finally {
+    oauthExchanges.delete(key)
+  }
+}
+
+async function performOAuthExchange(
+  refreshToken: string,
+  timeoutMs: number,
 ): Promise<RefreshOutcome> {
   const body = new URLSearchParams({
     grant_type: "refresh_token",
@@ -334,7 +405,7 @@ export async function refreshViaOAuthDetailed(
 
   try {
     log("refresh_started", { source: "oauth" })
-    const response = await fetchWithRetry(OAUTH_TOKEN_URL, {
+    const response = await fetch(OAUTH_TOKEN_URL, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: body.toString(),

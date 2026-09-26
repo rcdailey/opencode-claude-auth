@@ -4,10 +4,11 @@ import {
   getCachedCredentials,
   loadPersistedAccountSource,
   refreshAccountsList,
-  refreshViaOAuth,
+  refreshViaOAuthDetailed,
   reloadCredentialsFromSource,
   saveAccountSource,
   setActiveAccountSource,
+  type RefreshOutcome,
 } from "./credentials.ts"
 import {
   refreshAccount,
@@ -48,7 +49,8 @@ export interface OAuthDeps {
     source: string,
     configDir: string | undefined,
   ) => ClaudeCredentials | null
-  refreshViaOAuth: (refreshToken: string) => Promise<ClaudeCredentials | null>
+  /** Shares exchanges and returns cooldown information instead of hiding temporary failures. */
+  refreshViaOAuthDetailed: (refreshToken: string) => Promise<RefreshOutcome>
   writeBackCredentials: (
     source: string,
     creds: ClaudeCredentials,
@@ -216,11 +218,27 @@ export async function refreshOAuthCredential(
   if (current.refreshToken !== value.refresh)
     deps.log("refresh_using_stored_refresh_token", { source })
 
-  const refreshed = await deps.refreshViaOAuth(current.refreshToken)
-  if (!refreshed)
+  const outcome = await deps.refreshViaOAuthDetailed(current.refreshToken)
+  if (outcome.kind !== "ok") {
+    const reason = outcome.status
+      ? `HTTP ${outcome.status}`
+      : "network error or timeout"
+    const code = outcome.oauthError ? `, ${outcome.oauthError}` : ""
+    if (outcome.kind === "transient") {
+      const seconds = Math.max(
+        1,
+        Math.ceil((outcome.retryAfterMs ?? 1000) / 1000),
+      )
+      throw new Error(
+        `Claude OAuth refresh temporarily unavailable (${reason}${code}). ` +
+          `Retry in ${seconds}s; re-authentication is not indicated.`,
+      )
+    }
     throw new Error(
-      "Claude OAuth refresh failed. Run `claude` to re-authenticate.",
+      `Claude OAuth refresh rejected (${reason}${code}). Run \`claude\` to re-authenticate.`,
     )
+  }
+  const refreshed = outcome.creds
   if (source)
     deps.writeBackCredentials(source, refreshed, configDir, current.accessToken)
   return Credential.OAuth.make({
@@ -249,7 +267,7 @@ export const realOAuthDeps: OAuthDeps = {
   saveAccountSource,
   reloadCredentialsFromSource,
   readStoredCredentials: refreshAccount,
-  refreshViaOAuth,
+  refreshViaOAuthDetailed,
   writeBackCredentials,
   log,
 }
